@@ -237,6 +237,7 @@ export default function VideoStudio({
   historyItems,
   droppedFiles,
   onFilesHandled,
+  engineUrl = null, // e.g. "/api/engine" — when set, generation runs server-side
 }) {
   const PERSIST_KEY = "hg_video_studio_persistent";
 
@@ -313,6 +314,7 @@ export default function VideoStudio({
   const videoFileInputRef = useRef(null);
   const resultVideoRef = useRef(null);
   const hasRestored = useRef(false);
+  const pollingRefs = useRef(new Map()); // jobId → intervalId for engine polling
 
   // ── derived data ──
   const history = historyItems ?? localHistory;
@@ -820,6 +822,118 @@ export default function VideoStudio({
     setShowCanvas(true);
   }, []);
 
+  // ── engine: poll a server-side job until done or error ───────────────────
+  const startEnginePolling = useCallback((jobId, model) => {
+    if (pollingRefs.current.has(jobId)) return;
+
+    const intervalId = setInterval(async () => {
+      try {
+        const res = await fetch(`${engineUrl}/jobs/${jobId}`, {
+          headers: { 'x-api-key': apiKey },
+        });
+        if (!res.ok) return;
+        const job = await res.json();
+
+        if (job.status === 'done' && job.url) {
+          clearInterval(intervalId);
+          pollingRefs.current.delete(jobId);
+
+          setLocalHistory((prev) =>
+            prev.map((e) =>
+              e.id === jobId ? { ...e, url: job.url, jobStatus: 'done' } : e,
+            ),
+          );
+
+          showVideoInCanvas(job.url, model);
+
+          // Preserve the muapi requestId so Seedance extend works
+          if (model === 'seedance-v2.0-t2v' || model === 'seedance-v2.0-i2v') {
+            setLastGenerationId(job.requestId || job.id);
+            setLastGenerationModel(model);
+          }
+
+          if (onGenerationComplete) {
+            onGenerationComplete({ url: job.url, model, type: 'video' });
+          }
+        } else if (job.status === 'error') {
+          clearInterval(intervalId);
+          pollingRefs.current.delete(jobId);
+
+          setLocalHistory((prev) =>
+            prev.map((e) =>
+              e.id === jobId
+                ? { ...e, jobStatus: 'error', error: job.error }
+                : e,
+            ),
+          );
+
+          setGenerateError(
+            (job.error || 'Generation failed').slice(0, 80),
+          );
+          setTimeout(() => setGenerateError(null), 5000);
+        }
+      } catch {
+        // transient network error — keep polling
+      }
+    }, 2000);
+
+    pollingRefs.current.set(jobId, intervalId);
+  }, [engineUrl, apiKey, showVideoInCanvas, onGenerationComplete]);
+
+  // ── engine: recover pending jobs when component mounts ───────────────────
+  useEffect(() => {
+    if (!engineUrl || !apiKey) return;
+
+    fetch(`${engineUrl}/jobs`, { headers: { 'x-api-key': apiKey } })
+      .then((r) => (r.ok ? r.json() : []))
+      .then((jobs) => {
+        if (!Array.isArray(jobs) || jobs.length === 0) return;
+
+        setLocalHistory((prev) => {
+          const existingIds = new Set(prev.map((e) => e.id));
+          const toAdd = [];
+          for (const job of jobs) {
+            if (existingIds.has(job.id)) continue;
+            if (job.status === 'done' && job.url) {
+              toAdd.push({
+                id: job.id,
+                url: job.url,
+                jobStatus: 'done',
+                prompt: job.prompt,
+                model: job.model,
+                timestamp: new Date(job.completedAt || job.createdAt).toISOString(),
+              });
+            } else if (job.status === 'running' || job.status === 'queued') {
+              toAdd.push({
+                id: job.id,
+                url: null,
+                jobStatus: job.status,
+                prompt: job.prompt,
+                model: job.model,
+                timestamp: new Date(job.createdAt).toISOString(),
+              });
+            }
+          }
+          return toAdd.length ? [...toAdd, ...prev].slice(0, 30) : prev;
+        });
+
+        // Re-attach polling for any jobs still in progress
+        for (const job of jobs) {
+          if (job.status === 'running' || job.status === 'queued') {
+            startEnginePolling(job.id, job.model);
+          }
+        }
+      })
+      .catch(() => {});
+  }, [engineUrl, apiKey, startEnginePolling]);
+
+  // ── engine: cleanup polling intervals on unmount ─────────────────────────
+  useEffect(() => {
+    return () => {
+      pollingRefs.current.forEach((id) => clearInterval(id));
+    };
+  }, []);
+
   // ── generate ──────────────────────────────────────────────────────────────
   const handleGenerate = useCallback(async () => {
     const currentModel = getCurrentModel();
@@ -856,6 +970,75 @@ export default function VideoStudio({
         alert("Please enter a prompt to generate a video.");
         return;
       }
+    }
+
+    // ── Engine mode: fire-and-forget server-side generation ──────────────────
+    if (engineUrl) {
+      setGenerating(true);
+      setGenerateError(null);
+      try {
+        const enginePayload = { model: selectedModel };
+        if (v2vMode) {
+          enginePayload.type = 'v2v';
+          enginePayload.video_url = uploadedVideoUrl;
+          if (currentModel?.imageField && uploadedImageUrl) enginePayload.image_url = uploadedImageUrl;
+          if (currentModel?.hasPrompt && trimmedPrompt) enginePayload.prompt = trimmedPrompt;
+        } else if (imageMode) {
+          enginePayload.type = 'i2v';
+          enginePayload.image_url = uploadedImageUrl;
+          if (trimmedPrompt) enginePayload.prompt = trimmedPrompt;
+          enginePayload.aspect_ratio = selectedAr;
+          const i2vModel = i2vModels.find((m) => m.id === selectedModel);
+          if (uploadedEndImageUrl && i2vModel?.lastImageField) enginePayload.last_image = uploadedEndImageUrl;
+          const i2vDurations = getDurationsForI2VModel(selectedModel);
+          if (i2vDurations.length > 0) enginePayload.duration = selectedDuration;
+          const i2vResolutions = getResolutionsForI2VModel(selectedModel);
+          if (i2vResolutions.length > 0) enginePayload.resolution = selectedResolution;
+          if (selectedQuality) enginePayload.quality = selectedQuality;
+          if (selectedMode) enginePayload.mode = selectedMode;
+        } else {
+          enginePayload.type = 't2v';
+          if (trimmedPrompt) enginePayload.prompt = trimmedPrompt;
+          if (isExtendMode) {
+            enginePayload.request_id = lastGenerationId;
+          } else {
+            enginePayload.aspect_ratio = selectedAr;
+          }
+          const t2vDurations = getDurationsForModel(selectedModel);
+          if (t2vDurations.length > 0) enginePayload.duration = selectedDuration;
+          const t2vResolutions = getResolutionsForVideoModel(selectedModel);
+          if (t2vResolutions.length > 0) enginePayload.resolution = selectedResolution;
+          if (selectedQuality) enginePayload.quality = selectedQuality;
+          if (selectedMode) enginePayload.mode = selectedMode;
+        }
+        const engineRes = await fetch(`${engineUrl}/generate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey },
+          body: JSON.stringify(enginePayload),
+        });
+        if (!engineRes.ok) {
+          const errData = await engineRes.json().catch(() => ({}));
+          throw new Error(errData.error || `Engine error: ${engineRes.status}`);
+        }
+        const { jobId } = await engineRes.json();
+        addToLocalHistory({
+          id: jobId,
+          url: null,
+          jobStatus: 'running',
+          prompt: trimmedPrompt,
+          model: selectedModel,
+          aspect_ratio: v2vMode ? null : selectedAr,
+          duration: selectedDuration,
+          timestamp: new Date().toISOString(),
+        });
+        startEnginePolling(jobId, selectedModel);
+      } catch (e) {
+        setGenerateError(e.message?.slice(0, 80) || 'Submit failed');
+        setTimeout(() => setGenerateError(null), 4000);
+      } finally {
+        setGenerating(false);
+      }
+      return;
     }
 
     setGenerating(true);
@@ -1016,12 +1199,15 @@ export default function VideoStudio({
     selectedQuality,
     selectedMode,
     uploadedImageUrl,
+    uploadedEndImageUrl,
     uploadedVideoUrl,
     lastGenerationId,
     getCurrentModel,
     addToLocalHistory,
     showVideoInCanvas,
     onGenerationComplete,
+    engineUrl,
+    startEnginePolling,
   ]);
 
   // ── reset to prompt bar ───────────────────────────────────────────────────
@@ -1095,74 +1281,94 @@ export default function VideoStudio({
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 w-full pt-4 animate-fade-in-up">
             {history.map((entry, idx) => {
               const isSeedance2 = entry.model === "seedance-v2.0-t2v" || entry.model === "seedance-v2.0-i2v";
+              const isPending = !entry.url && entry.jobStatus === 'running';
+              const isJobError = !entry.url && entry.jobStatus === 'error';
               return (
                 <div
                   key={entry.id || idx}
                   className="relative group rounded-lg overflow-hidden border border-white/10 bg-[#0a0a0a] shadow-xl hover:border-primary/50 transition-all duration-300 flex flex-col"
                 >
-                  <video
-                    src={entry.url}
-                    className="w-full aspect-video object-cover bg-black/40 cursor-pointer hover:opacity-80 transition-opacity"
-                    onClick={() => setFullscreenUrl(entry.url)}
-                    controls={false}
-                    loop
-                    muted
-                    playsInline
-                    onMouseOver={(e) => e.target.play()}
-                    onMouseOut={(e) => {
-                      e.target.pause();
-                      e.target.currentTime = 0;
-                    }}
-                  />
-                  
-                  {/* Overlay actions */}
-                  <div className="absolute top-2 right-2 flex flex-col gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <button
-                      type="button"
-                      title="Fullscreen"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setFullscreenUrl(entry.url);
-                      }}
-                      className="p-2 bg-black/60 backdrop-blur-md rounded-full text-white hover:bg-primary hover:text-black transition-all border border-white/10"
-                    >
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                        <polyline points="15 3 21 3 21 9" />
-                        <polyline points="9 21 3 21 3 15" />
-                        <line x1="21" y1="3" x2="14" y2="10" />
-                        <line x1="3" y1="21" x2="10" y2="14" />
+                  {isPending ? (
+                    <div className="w-full aspect-video bg-black/40 flex flex-col items-center justify-center gap-3">
+                      <div className="w-10 h-10 rounded-full border-2 border-primary/30 border-t-primary animate-spin" />
+                      <span className="text-white/40 text-xs">Generating…</span>
+                    </div>
+                  ) : isJobError ? (
+                    <div className="w-full aspect-video bg-black/40 flex flex-col items-center justify-center gap-2 px-4">
+                      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2">
+                        <circle cx="12" cy="12" r="10" />
+                        <line x1="12" y1="8" x2="12" y2="12" />
+                        <line x1="12" y1="16" x2="12.01" y2="16" />
                       </svg>
-                    </button>
-                    <button
-                      type="button"
-                      title="Download"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        downloadFile(entry.url, `video-${entry.id || idx}.mp4`);
+                      <span className="text-red-400 text-xs text-center line-clamp-2">{entry.error || 'Generation failed'}</span>
+                    </div>
+                  ) : (
+                    <video
+                      src={entry.url}
+                      className="w-full aspect-video object-cover bg-black/40 cursor-pointer hover:opacity-80 transition-opacity"
+                      onClick={() => setFullscreenUrl(entry.url)}
+                      controls={false}
+                      loop
+                      muted
+                      playsInline
+                      onMouseOver={(e) => e.target.play()}
+                      onMouseOut={(e) => {
+                        e.target.pause();
+                        e.target.currentTime = 0;
                       }}
-                      className="p-2 bg-black/60 backdrop-blur-md rounded-full text-white hover:bg-primary hover:text-black transition-all border border-white/10"
-                    >
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" />
-                      </svg>
-                    </button>
-                    {isSeedance2 && (
+                    />
+                  )}
+
+                  {/* Overlay actions — only for completed videos */}
+                  {!isPending && !isJobError && (
+                    <div className="absolute top-2 right-2 flex flex-col gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                       <button
                         type="button"
-                        title="Extend this video using Seedance 2.0 Extend"
+                        title="Fullscreen"
                         onClick={(e) => {
                           e.stopPropagation();
-                          setLastGenerationId(entry.id);
-                          handleExtend();
+                          setFullscreenUrl(entry.url);
                         }}
                         className="p-2 bg-black/60 backdrop-blur-md rounded-full text-white hover:bg-primary hover:text-black transition-all border border-white/10"
                       >
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <path d="M5 12h14M12 5l7 7-7 7" />
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                          <polyline points="15 3 21 3 21 9" />
+                          <polyline points="9 21 3 21 3 15" />
+                          <line x1="21" y1="3" x2="14" y2="10" />
+                          <line x1="3" y1="21" x2="10" y2="14" />
                         </svg>
                       </button>
-                    )}
-                  </div>
+                      <button
+                        type="button"
+                        title="Download"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          downloadFile(entry.url, `video-${entry.id || idx}.mp4`);
+                        }}
+                        className="p-2 bg-black/60 backdrop-blur-md rounded-full text-white hover:bg-primary hover:text-black transition-all border border-white/10"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                          <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" />
+                        </svg>
+                      </button>
+                      {isSeedance2 && (
+                        <button
+                          type="button"
+                          title="Extend this video using Seedance 2.0 Extend"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setLastGenerationId(entry.id);
+                            handleExtend();
+                          }}
+                          className="p-2 bg-black/60 backdrop-blur-md rounded-full text-white hover:bg-primary hover:text-black transition-all border border-white/10"
+                        >
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M5 12h14M12 5l7 7-7 7" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  )}
 
                   {/* Prompt & Details */}
                   <div className="p-3 bg-black/80 backdrop-blur-sm border-t border-white/5 flex-1 flex flex-col justify-between gap-2">
