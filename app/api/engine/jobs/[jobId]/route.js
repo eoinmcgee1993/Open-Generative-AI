@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getJob, publicJob } from '@/lib/engine/store';
+import { checkJob } from '@/lib/engine/worker';
 
 function getApiKey(request) {
   return (
@@ -26,5 +27,9 @@ export async function GET(request, { params }) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
   }
 
-  return NextResponse.json(publicJob(job));
+  // Drive muapi polling on-demand: each client poll triggers one muapi check.
+  // This keeps the engine serverless-compatible — no background threads needed.
+  await checkJob(job);
+
+  return NextResponse.json(publicJob(getJob(jobId)));
 }

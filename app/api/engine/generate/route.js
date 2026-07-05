@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
-import { createJob } from '@/lib/engine/store';
-import { runJob } from '@/lib/engine/worker';
+import { createJob, getJob } from '@/lib/engine/store';
+import { submitJob } from '@/lib/engine/worker';
 import {
   getVideoModelById,
   getI2VModelById,
@@ -97,8 +97,11 @@ export async function POST(request) {
 
   const job = createJob({ prompt, model, type, apiKey });
 
-  // Fire-and-forget: the worker keeps running even if the browser disconnects
-  runJob(job, endpoint, payload).catch(() => {});
+  // Submit to muapi and store requestId — awaited so the requestId is persisted
+  // before the client's first status poll. Polling then happens on-demand in the
+  // status endpoint, so this works on any serverless platform.
+  await submitJob(job, endpoint, payload);
 
-  return NextResponse.json({ jobId: job.id, status: job.status }, { status: 202 });
+  const current = getJob(job.id);
+  return NextResponse.json({ jobId: job.id, status: current.status }, { status: 202 });
 }
